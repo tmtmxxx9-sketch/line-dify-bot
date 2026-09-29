@@ -1,0 +1,6 @@
+# LINE ↔ Dify relay (Render / production)
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+httpx==0.28.1
+python-dotenv==1.2.3
+line-bot-sdk==3.25.0
