@@ -39,6 +39,7 @@ DIFY_API_BASE = (
     or "https://api.dify.ai/v1"
 ).strip().rstrip("/")
 DIFY_USER_PREFIX = os.getenv("DIFY_USER_PREFIX", "line-").strip()
+DIFY_TARGET_AGENT = os.getenv("DIFY_TARGET_AGENT", "ソル（Cursor）").strip()
 
 if not LINE_CHANNEL_SECRET:
     logger.warning("LINE_CHANNEL_SECRET is not set")
@@ -52,7 +53,15 @@ line_configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 # LINE userId -> Dify conversation_id
 _conversations: dict[str, str] = {}
 
-app = FastAPI(title="LINE-Dify Relay", version="1.2.0")
+app = FastAPI(title="LINE-Dify Relay", version="1.3.0")
+
+
+def _dify_flow_inputs(user_msg: str) -> dict[str, str]:
+    """Dify チャットフロー開始ノードの必須変数。"""
+    return {
+        "target_agent": DIFY_TARGET_AGENT,
+        "raw_input": user_msg,
+    }
 
 
 def _dify_user_id(line_user_id: str) -> str:
@@ -77,8 +86,9 @@ async def call_dify_chat_async(line_user_id: str, query: str) -> str:
     }
 
     chat_url = f"{DIFY_API_BASE}/chat-messages"
+    flow_inputs = _dify_flow_inputs(query)
     chat_payload: dict[str, Any] = {
-        "inputs": {},
+        "inputs": flow_inputs,
         "query": query,
         "response_mode": "blocking",
         "user": user,
@@ -89,17 +99,17 @@ async def call_dify_chat_async(line_user_id: str, query: str) -> str:
 
     completion_url = f"{DIFY_API_BASE}/completion-messages"
     completion_payload: dict[str, Any] = {
-        "inputs": {"query": query},
+        "inputs": flow_inputs,
         "response_mode": "blocking",
         "user": user,
     }
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         logger.info(
-            "Calling Dify chat-messages: %s user=%s query_len=%d",
+            "Calling Dify chat-flow: %s user=%s inputs=%s",
             chat_url,
             user,
-            len(query),
+            flow_inputs,
         )
         chat_res = await client.post(chat_url, json=chat_payload, headers=headers)
         logger.info("Dify chat-messages status: %s", chat_res.status_code)
@@ -116,12 +126,18 @@ async def call_dify_chat_async(line_user_id: str, query: str) -> str:
             answer = _extract_dify_answer(chat_data)
             if answer:
                 return answer
-            return f"Dify応答受信（本文空）: {chat_data}"
+            return "Difyからの回答が空でした。"
+
+        try:
+            chat_err = chat_res.json()
+            chat_err_msg = chat_err.get("message", chat_res.text)
+        except json.JSONDecodeError:
+            chat_err_msg = chat_res.text[:300]
 
         logger.warning(
             "chat-messages failed (%s): %s. Trying completion-messages.",
             chat_res.status_code,
-            chat_res.text[:500],
+            chat_err_msg,
         )
 
         logger.info("Calling Dify completion-messages: %s", completion_url)
@@ -144,8 +160,8 @@ async def call_dify_chat_async(line_user_id: str, query: str) -> str:
             return f"Dify応答受信（本文空）: {comp_data}"
 
         return (
-            f"Dify応答エラー(chat:{chat_res.status_code}, "
-            f"completion:{comp_res.status_code}): {comp_res.text[:300]}"
+            f"Dify応答エラー(chat:{chat_res.status_code}): {chat_err_msg} / "
+            f"completion:{comp_res.status_code}: {comp_res.text[:200]}"
         )
 
 
