@@ -14,7 +14,6 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
     ApiClient,
     Configuration,
@@ -22,7 +21,6 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 load_dotenv()
 
@@ -35,7 +33,11 @@ logger = logging.getLogger("line-dify-relay")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 DIFY_API_KEY = os.getenv("DIFY_API_KEY", "").strip()
-DIFY_API_BASE = os.getenv("DIFY_API_URL", "https://api.dify.ai/v1").strip().rstrip("/")
+DIFY_API_BASE = (
+    os.getenv("DIFY_API_BASE_URL")
+    or os.getenv("DIFY_API_URL")
+    or "https://api.dify.ai/v1"
+).strip().rstrip("/")
 DIFY_USER_PREFIX = os.getenv("DIFY_USER_PREFIX", "line-").strip()
 
 if not LINE_CHANNEL_SECRET:
@@ -45,20 +47,21 @@ if not LINE_CHANNEL_ACCESS_TOKEN:
 if not DIFY_API_KEY:
     logger.warning("DIFY_API_KEY is not set")
 
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
 line_configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 
 # LINE userId -> Dify conversation_id
 _conversations: dict[str, str] = {}
 
-app = FastAPI(title="LINE-Dify Relay", version="1.0.0")
+app = FastAPI(title="LINE-Dify Relay", version="1.1.0")
 
 
 def _dify_user_id(line_user_id: str) -> str:
+    if line_user_id.startswith(DIFY_USER_PREFIX):
+        return line_user_id
     return f"{DIFY_USER_PREFIX}{line_user_id}"
 
 
-def call_dify_chat(line_user_id: str, query: str) -> str:
+async def call_dify_chat_async(line_user_id: str, query: str) -> str:
     url = f"{DIFY_API_BASE}/chat-messages"
     payload: dict[str, Any] = {
         "inputs": {},
@@ -75,32 +78,43 @@ def call_dify_chat(line_user_id: str, query: str) -> str:
         "Content-Type": "application/json",
     }
 
-    with httpx.Client(timeout=120.0) as client:
-        response = client.post(url, json=payload, headers=headers)
-        if response.status_code >= 400:
-            logger.error("Dify error %s: %s", response.status_code, response.text)
-            response.raise_for_status()
+    logger.info("Calling Dify: %s user=%s query_len=%d", url, payload["user"], len(query))
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url, json=payload, headers=headers)
+
+    logger.info("Dify status code: %s", response.status_code)
+    body_preview = response.text[:500] if response.text else ""
+    logger.info("Dify response preview: %s", body_preview)
+
+    try:
         data = response.json()
+    except json.JSONDecodeError as exc:
+        logger.error("Dify JSON decode error: %s body=%s", exc, body_preview)
+        raise
+
+    if response.status_code >= 400:
+        logger.error("Dify API error: %s", data)
+        response.raise_for_status()
 
     new_conversation_id = data.get("conversation_id")
     if isinstance(new_conversation_id, str) and new_conversation_id:
         _conversations[line_user_id] = new_conversation_id
+        logger.info("Updated conversation_id for user %s", line_user_id)
 
     answer = data.get("answer")
     if isinstance(answer, str) and answer.strip():
         return answer.strip()
 
-    return "（Dify から応答を取得できませんでした）"
+    return f"Dify応答受信（本文空）: {data}"
 
 
-def reply_line_text(reply_token: str, text: str) -> None:
-    # LINE テキスト上限に合わせて分割（5000文字）
+def _reply_line_sync(reply_token: str, text: str) -> None:
     chunks: list[str] = []
-    remaining = text
+    remaining = text or "（空の応答）"
     while remaining:
         chunks.append(remaining[:5000])
         remaining = remaining[5000:]
-
     messages = [TextMessage(text=chunk) for chunk in chunks[:5]]
 
     with ApiClient(line_configuration) as api_client:
@@ -109,69 +123,41 @@ def reply_line_text(reply_token: str, text: str) -> None:
         )
 
 
-@handler.add(MessageEvent, message=TextMessageContent)
-def on_text_message(event: MessageEvent) -> None:
-    if not isinstance(event.message, TextMessageContent):
+async def reply_line_text_async(reply_token: str, text: str) -> None:
+    await asyncio.to_thread(_reply_line_sync, reply_token, text)
+
+
+async def handle_text_event(event: dict[str, Any]) -> None:
+    reply_token = event.get("replyToken")
+    message = event.get("message") or {}
+    user_msg = str(message.get("text", "")).strip()
+    source = event.get("source") or {}
+    user_id = source.get("userId") or "default_user"
+
+    if not reply_token:
+        logger.warning("Text event without replyToken: %s", event)
+        return
+    if not user_msg:
+        logger.info("Empty text from user %s — skipping Dify", user_id)
+        await reply_line_text_async(reply_token, "メッセージを入力してください。")
         return
 
-    user_id = event.source.user_id if event.source else None
-    if not user_id:
-        logger.warning("Message without user_id")
-        return
-
-    query = event.message.text.strip()
-    if not query:
-        reply_line_text(event.reply_token, "メッセージを入力してください。")
-        return
+    logger.info("Received user message: %s from %s", user_msg, user_id)
 
     try:
-        answer = call_dify_chat(user_id, query)
+        reply_text = await call_dify_chat_async(user_id, user_msg)
     except httpx.HTTPError as exc:
-        logger.exception("Dify request failed: %s", exc)
-        reply_line_text(
-            event.reply_token,
-            "申し訳ありません。しばらくしてからもう一度お試しください。",
-        )
-        return
-    except Exception:
-        logger.exception("Unexpected error while calling Dify")
-        reply_line_text(
-            event.reply_token,
-            "内部エラーが発生しました。",
-        )
-        return
+        logger.error("Dify HTTP error: %s", exc, exc_info=True)
+        reply_text = f"Dify通信エラー: {exc}"
+    except Exception as exc:
+        logger.error("Dify error: %s", exc, exc_info=True)
+        reply_text = f"Dify通信エラー: {exc}"
 
-    reply_line_text(event.reply_token, answer)
-
-
-async def process_text_events_fallback(events: list[Any]) -> None:
-    """署名検証失敗時に JSON から直接テキストメッセージを処理する。"""
-    for event_dict in events:
-        if not isinstance(event_dict, dict):
-            continue
-        if event_dict.get("type") != "message":
-            continue
-        message = event_dict.get("message")
-        if not isinstance(message, dict) or message.get("type") != "text":
-            continue
-
-        reply_token = event_dict.get("replyToken")
-        user_msg = str(message.get("text", "")).strip()
-        if not reply_token or not user_msg:
-            continue
-
-        user_id = (event_dict.get("source") or {}).get("userId") or "default_user"
-
-        try:
-            reply_text = await asyncio.to_thread(call_dify_chat, user_id, user_msg)
-        except Exception as ex:
-            logger.error("Dify request error: %s", ex)
-            reply_text = "Difyとの通信でエラーが発生しました。"
-
-        try:
-            await asyncio.to_thread(reply_line_text, reply_token, reply_text)
-        except Exception as line_ex:
-            logger.error("LINE reply error: %s", line_ex)
+    try:
+        await reply_line_text_async(reply_token, reply_text)
+        logger.info("Replied to LINE successfully (len=%d)", len(reply_text))
+    except Exception as exc:
+        logger.error("LINE reply error: %s", exc, exc_info=True)
 
 
 @app.get("/")
@@ -188,23 +174,46 @@ async def health_check() -> dict[str, str]:
 async def callback(request: Request) -> JSONResponse:
     signature = request.headers.get("X-Line-Signature", "")
     body = (await request.body()).decode("utf-8")
+    logger.info(
+        "Webhook received. signature_present=%s body_len=%d",
+        bool(signature),
+        len(body),
+    )
+    logger.debug("Webhook body: %s", body)
 
     try:
         data = json.loads(body) if body else {}
         events = data.get("events", [])
+        if not isinstance(events, list):
+            events = []
         if not events:
+            logger.info("No events (verification ping)")
             return JSONResponse(status_code=200, content={"status": "verified"})
-    except Exception:
+    except Exception as exc:
+        logger.error("JSON Parse Error: %s", exc, exc_info=True)
         return JSONResponse(status_code=200, content={"status": "invalid_json"})
 
-    try:
-        await asyncio.to_thread(handler.handle, body, signature)
-    except Exception as e:
-        logger.warning(
-            "Signature failed or handler bypassed: %s. Executing direct fallback.",
-            e,
-        )
-        await process_text_events_fallback(events)
+    logger.info("Processing %d event(s)", len(events))
+
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            logger.warning("Event[%d] is not a dict: %r", index, event)
+            continue
+        event_type = event.get("type")
+        logger.info("Event[%d] type=%s", index, event_type)
+
+        if event_type != "message":
+            continue
+
+        message = event.get("message") or {}
+        if message.get("type") != "text":
+            logger.info("Event[%d] non-text message type=%s", index, message.get("type"))
+            continue
+
+        try:
+            await handle_text_event(event)
+        except Exception as exc:
+            logger.error("Failed to handle event[%d]: %s", index, exc, exc_info=True)
 
     return JSONResponse(status_code=200, content={"status": "ok"})
 
