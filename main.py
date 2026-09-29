@@ -52,7 +52,7 @@ line_configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 # LINE userId -> Dify conversation_id
 _conversations: dict[str, str] = {}
 
-app = FastAPI(title="LINE-Dify Relay", version="1.1.0")
+app = FastAPI(title="LINE-Dify Relay", version="1.2.0")
 
 
 def _dify_user_id(line_user_id: str) -> str:
@@ -61,52 +61,92 @@ def _dify_user_id(line_user_id: str) -> str:
     return f"{DIFY_USER_PREFIX}{line_user_id}"
 
 
-async def call_dify_chat_async(line_user_id: str, query: str) -> str:
-    url = f"{DIFY_API_BASE}/chat-messages"
-    payload: dict[str, Any] = {
-        "inputs": {},
-        "query": query,
-        "response_mode": "blocking",
-        "user": _dify_user_id(line_user_id),
-    }
-    conversation_id = _conversations.get(line_user_id)
-    if conversation_id:
-        payload["conversation_id"] = conversation_id
+def _extract_dify_answer(data: dict[str, Any]) -> str:
+    answer = data.get("answer")
+    if isinstance(answer, str) and answer.strip():
+        return answer.strip()
+    return ""
 
+
+async def call_dify_chat_async(line_user_id: str, query: str) -> str:
+    """Chatbot (/chat-messages) を優先し、失敗時は Completion (/completion-messages) へフォールバック。"""
+    user = _dify_user_id(line_user_id)
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    logger.info("Calling Dify: %s user=%s query_len=%d", url, payload["user"], len(query))
+    chat_url = f"{DIFY_API_BASE}/chat-messages"
+    chat_payload: dict[str, Any] = {
+        "inputs": {},
+        "query": query,
+        "response_mode": "blocking",
+        "user": user,
+    }
+    conversation_id = _conversations.get(line_user_id)
+    if conversation_id:
+        chat_payload["conversation_id"] = conversation_id
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(url, json=payload, headers=headers)
+    completion_url = f"{DIFY_API_BASE}/completion-messages"
+    completion_payload: dict[str, Any] = {
+        "inputs": {"query": query},
+        "response_mode": "blocking",
+        "user": user,
+    }
 
-    logger.info("Dify status code: %s", response.status_code)
-    body_preview = response.text[:500] if response.text else ""
-    logger.info("Dify response preview: %s", body_preview)
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        logger.info(
+            "Calling Dify chat-messages: %s user=%s query_len=%d",
+            chat_url,
+            user,
+            len(query),
+        )
+        chat_res = await client.post(chat_url, json=chat_payload, headers=headers)
+        logger.info("Dify chat-messages status: %s", chat_res.status_code)
+        logger.info("Dify chat-messages body preview: %s", chat_res.text[:500])
 
-    try:
-        data = response.json()
-    except json.JSONDecodeError as exc:
-        logger.error("Dify JSON decode error: %s body=%s", exc, body_preview)
-        raise
+        if chat_res.status_code == 200:
+            try:
+                chat_data = chat_res.json()
+            except json.JSONDecodeError:
+                return f"Dify応答エラー(chat): invalid JSON {chat_res.text[:200]}"
+            new_conversation_id = chat_data.get("conversation_id")
+            if isinstance(new_conversation_id, str) and new_conversation_id:
+                _conversations[line_user_id] = new_conversation_id
+            answer = _extract_dify_answer(chat_data)
+            if answer:
+                return answer
+            return f"Dify応答受信（本文空）: {chat_data}"
 
-    if response.status_code >= 400:
-        logger.error("Dify API error: %s", data)
-        response.raise_for_status()
+        logger.warning(
+            "chat-messages failed (%s): %s. Trying completion-messages.",
+            chat_res.status_code,
+            chat_res.text[:500],
+        )
 
-    new_conversation_id = data.get("conversation_id")
-    if isinstance(new_conversation_id, str) and new_conversation_id:
-        _conversations[line_user_id] = new_conversation_id
-        logger.info("Updated conversation_id for user %s", line_user_id)
+        logger.info("Calling Dify completion-messages: %s", completion_url)
+        comp_res = await client.post(
+            completion_url,
+            json=completion_payload,
+            headers=headers,
+        )
+        logger.info("Dify completion-messages status: %s", comp_res.status_code)
+        logger.info("Dify completion-messages body preview: %s", comp_res.text[:500])
 
-    answer = data.get("answer")
-    if isinstance(answer, str) and answer.strip():
-        return answer.strip()
+        if comp_res.status_code == 200:
+            try:
+                comp_data = comp_res.json()
+            except json.JSONDecodeError:
+                return f"Dify応答エラー(completion): invalid JSON {comp_res.text[:200]}"
+            answer = _extract_dify_answer(comp_data)
+            if answer:
+                return answer
+            return f"Dify応答受信（本文空）: {comp_data}"
 
-    return f"Dify応答受信（本文空）: {data}"
+        return (
+            f"Dify応答エラー(chat:{chat_res.status_code}, "
+            f"completion:{comp_res.status_code}): {comp_res.text[:300]}"
+        )
 
 
 def _reply_line_sync(reply_token: str, text: str) -> None:
@@ -148,10 +188,10 @@ async def handle_text_event(event: dict[str, Any]) -> None:
         reply_text = await call_dify_chat_async(user_id, user_msg)
     except httpx.HTTPError as exc:
         logger.error("Dify HTTP error: %s", exc, exc_info=True)
-        reply_text = f"Dify通信エラー: {exc}"
+        reply_text = f"Dify通信例外: {exc}"
     except Exception as exc:
         logger.error("Dify error: %s", exc, exc_info=True)
-        reply_text = f"Dify通信エラー: {exc}"
+        reply_text = f"Dify通信例外: {exc}"
 
     try:
         await reply_line_text_async(reply_token, reply_text)
