@@ -12,7 +12,8 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -52,37 +53,6 @@ line_configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 _conversations: dict[str, str] = {}
 
 app = FastAPI(title="LINE-Dify Relay", version="1.0.0")
-
-
-def _get_line_signature(request: Request) -> str | None:
-    """X-Line-Signature を厳密に取得（大小文字の差異を吸収）。"""
-    for name in ("x-line-signature", "X-Line-Signature"):
-        value = request.headers.get(name)
-        if value is not None and value.strip():
-            return value.strip()
-    return None
-
-
-def _webhook_events_count(body: str) -> int | None:
-    """本文から events 件数を推定。パース不能時は None。"""
-    if not body.strip():
-        return 0
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    events = payload.get("events")
-    if events is None:
-        return 0
-    if isinstance(events, list):
-        return len(events)
-    return None
-
-
-def _process_line_webhook(body: str, signature: str) -> None:
-    handler.handle(body, signature)
 
 
 def _dify_user_id(line_user_id: str) -> str:
@@ -186,34 +156,29 @@ async def health_check() -> dict[str, str]:
 
 
 @app.post("/callback")
-async def line_webhook(request: Request) -> dict[str, str]:
-    signature = _get_line_signature(request)
-    if not signature:
-        logger.warning("Missing X-Line-Signature header")
-        raise HTTPException(status_code=400, detail="Missing X-Line-Signature")
+async def callback(request: Request) -> JSONResponse:
+    signature = request.headers.get("X-Line-Signature", "")
+    body = (await request.body()).decode("utf-8")
 
+    # LINE Developersの「検証」用ダミーリクエスト対策
     try:
-        body_bytes = await request.body()
-        body = body_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        logger.warning("Webhook body is not valid UTF-8: %s", exc)
-        raise HTTPException(status_code=400, detail="Invalid request body") from exc
-
-    event_count = _webhook_events_count(body)
-    if event_count == 0:
-        logger.info("LINE webhook with no events (verification ping or empty delivery)")
-
-    try:
-        await asyncio.to_thread(_process_line_webhook, body, signature)
-    except InvalidSignatureError as exc:
-        logger.warning("Invalid LINE signature: %s", exc)
-        raise HTTPException(status_code=400, detail="Invalid signature") from exc
-    except json.JSONDecodeError as exc:
-        logger.warning("Webhook JSON parse error after signature path: %s", exc)
+        data = json.loads(body) if body else {}
+        events = data.get("events", [])
+        if len(events) == 0:
+            return JSONResponse(status_code=200, content={"status": "verified"})
     except Exception:
-        logger.exception("Webhook handler error (responding 200 to LINE)")
+        pass
 
-    return {"status": "ok"}
+    try:
+        await asyncio.to_thread(handler.handle, body, signature)
+    except InvalidSignatureError:
+        logger.warning("Invalid signature received")
+        return JSONResponse(status_code=200, content={"status": "ok"})
+    except Exception as e:
+        logger.error("Error handling event: %s", e)
+        return JSONResponse(status_code=200, content={"status": "handled"})
+
+    return JSONResponse(status_code=200, content={"status": "ok"})
 
 
 if __name__ == "__main__":
